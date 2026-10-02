@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ogün Babacan</title>
+<meta name="description" content="Ogün Babacan — developing stuff at Trendyol GO.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;800&display=swap" rel="stylesheet">
+<script>
+  // one hue drives every colour; OKLCH keeps lightness, and so contrast, the same whatever the hue
+  window.palette = h => ({
+    bg: `oklch(0.17 0.035 ${h})`,
+    fg: `oklch(0.86 0.13 ${h})`
+  });
+  window.paintHue = h => {
+    const s = document.documentElement.style, p = palette(h);
+    for (const k in p) s.setProperty('--' + k, p[k]);
+    window.hue = h;
+  };
+  paintHue(Math.floor(Math.random() * 360));
+</script>
+<style>
+  :root {
+    --bg: #0c0c0c;
+    --fg: #ececec;
+  }
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.5 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  body { height: 100dvh; cursor: crosshair; }
+
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+  /* everything visible is drawn on the canvas; this copy is for screen readers and search */
+  .sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  /* real, focusable links laid exactly over their canvas glyphs */
+  .hit {
+    position: fixed;
+    color: transparent;
+    text-decoration: none;
+    outline: none;
+    cursor: pointer;
+    overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+</style>
+</head>
+<body>
+<canvas id="field" aria-hidden="true"></canvas>
+
+<main class="sr">
+  <h1>Ogün Babacan</h1>
+  <p>developing stuff at Trendyol GO</p>
+  <p>Istanbul, Turkey</p>
+</main>
+
+<nav aria-label="Links">
+  <a class="hit" href="https://github.com/Trendyol" target="_blank" rel="noopener">Trendyol GO</a>
+  <a class="hit" href="https://github.com/ogunb" target="_blank" rel="noopener">GitHub</a>
+  <a class="hit" href="https://www.linkedin.com/in/ogunbabacan" target="_blank" rel="noopener">LinkedIn</a>
+  <a class="hit" href="mailto:babacanogun@gmail.com">Email</a>
+</nav>
+
+<script>
+(() => {
+  const canvas = document.getElementById('field');
+  const ctx = canvas.getContext('2d');
+  const links = [...document.querySelectorAll('.hit')];
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  const MONO = '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+  const NAME = 'Ogün Babacan';
+  const RAMP = ' .:-=+*#%@';
+  const SIDE = ' #%+=-:..';      // banner extrusion, nearest layer first (index 0 unused)
+  const ALPHA = [0.2, 0.55, 1];   // dim, mid, bright
+  const SS = 2;                   // banner mask samples per cell
+  const DEPTH = 7;                // extrusion layers
+  const SPEED = 900;              // px/s: the ripple front and the colour reveal travel together
+  const LX = -0.45, LY = -0.55, LZ = 0.7;   // light from the top left
+
+  let pal = palette(hue);
+  let W, H, unit, cw, ch, cols, rows;
+  let textGrid, hitGrid, mask, mW, mH, Hall, Hwave, clockAt;
+
+  /* ---------- layout: everything snaps to the character grid ---------- */
+  const maskAt = (u, v) => {
+    const mi = Math.floor(u * SS), mj = Math.floor(v * SS);
+    return mi >= 0 && mj >= 0 && mi < mW && mj < mH && mask[mj * mW + mi] === 1;
+  };
+
+  // writes text into the grid with a blank cell either side so the sea never touches it
+  function put(str, c, r, link = -1) {
+    if (r < 0 || r >= rows) return;
+    for (let k = -1; k <= str.length; k++) {
+      const cc = c + k;
+      if (cc < 0 || cc >= cols) continue;
+      const idx = r * cols + cc;
+      if (k === -1 || k === str.length) {
+        if (textGrid[idx] === null) textGrid[idx] = ' ';
+      } else {
+        textGrid[idx] = str[k];
+        hitGrid[idx] = link;
+      }
+    }
+  }
+
+  function placeLink(i, label, c, r) {
+    put(label, c, r, i);
+    Object.assign(links[i].style, {
+      left: c * cw + 'px', top: r * ch + 'px', width: label.length * cw + 'px', height: ch + 'px'
+    });
+  }
+
+  const time = () => new Date().toLocaleTimeString('en-GB', { timeZone: 'Europe/Istanbul', hour12: false });
+  const tick = () => { if (clockAt) put(`Istanbul, TR ${time()}`, clockAt.c, clockAt.r); };
+  setInterval(tick, 1000);
+
+  function layout() {
+    W = innerWidth; H = innerHeight; unit = Math.min(W, H);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const fs = W < 640 ? 11 : 13;
+    ctx.font = `${fs}px ${MONO}`;
+    ctx.textBaseline = 'top';
+    cw = ctx.measureText('M').width;   // exact advance, so a row drawn as one string lines up with the cells
+    ch = Math.round(fs * 1.3);
+    cols = Math.ceil(W / cw); rows = Math.ceil(H / ch);
+
+    const n = cols * rows;
+    textGrid = new Array(n).fill(null);
+    hitGrid = new Int8Array(n).fill(-1);
+    Hall = new Float32Array(n);
+    Hwave = new Float32Array(n);
+
+    const pad = Math.min(44, Math.max(16, W * 0.032));
+    const mx = Math.max(2, Math.round(pad / cw)), my = Math.max(1, Math.round(pad / ch));
+
+    // the name, rasterised once into a mask at 2×2 samples per cell
+    // one line only when it can be tall enough to read; otherwise stack the two words
+    const lines = cols >= 72 && W / H > 1.25 ? [NAME] : NAME.split(' ');
+    const mc = document.createElement('canvas');
+    mW = cols * SS; mH = rows * SS;
+    mc.width = mW; mc.height = mH;
+    const m = mc.getContext('2d', { willReadFrequently: true });
+    m.font = `800 100px ${MONO}`;
+    const widest = Math.max(...lines.map(l => m.measureText(l).width));
+    const F = Math.min(100 * (W - 2 * mx * cw - 4 * cw) / widest, H * 0.46 / lines.length, 260);
+    m.setTransform(SS / cw, 0, 0, SS / ch, 0, 0);
+    m.font = `800 ${F}px ${MONO}`;
+    m.fillStyle = '#fff';
+    const lh = F * 0.95;
+    const top = H * 0.44 - lines.length * lh / 2;
+    lines.forEach((l, k) => m.fillText(l, mx * cw, top + k * lh + F * 0.78));
+    const px = m.getImageData(0, 0, mW, mH).data;
+    mask = new Uint8Array(mW * mH);
+    for (let i = 0; i < mask.length; i++) mask[i] = px[i * 4 + 3] > 110 ? 1 : 0;
+
+    // small text
+    put('ogun.dev', mx, my);
+    clockAt = { c: cols - mx - 21, r: my };
+    tick();
+    const roleRow = Math.min(rows - my - 4, Math.ceil((top + lines.length * lh) / ch) + 2);
+    put('developing stuff @ ', mx, roleRow);
+    placeLink(0, 'Trendyol GO', mx + 19, roleRow);
+    const lr = rows - 1 - my;
+    let c = mx;
+    // » rather than an arrow: the font subset has no arrows, and a fallback glyph would break the grid
+    [['github »', 1], ['linkedin »', 2], ['email »', 3]].forEach(([label, i]) => {
+      placeLink(i, label, c, lr);
+      c += label.length + 3;
+    });
+    const hint = 'click anywhere';
+    if (cols - mx - hint.length > c + 2) put(hint, cols - mx - hint.length, lr);
+  }
+
+  addEventListener('resize', layout);
+  layout();
+  if (document.fonts) {
+    Promise.all([document.fonts.load(`800 100px ${MONO}`), document.fonts.load(`13px ${MONO}`)]).then(layout, () => {});
+  }
+
+  /* ---------- the sea behind everything ---------- */
+  function field(x, y, t) {
+    const a = Math.sin(x * 4.2 + t * 0.35 + 2 * Math.sin(y * 3.1 - t * 0.25));
+    const b = Math.sin(y * 5.0 - t * 0.30 + 1.5 * Math.sin(x * 2.6 + t * 0.2));
+    const v = a * b * 0.5 + 0.5;
+    return v * v * v * v * 0.8;
+  }
+
+  /* ---------- input ---------- */
+  const mouse = { x: -1e4, y: -1e4, on: 0, s: 0 };
+  const waves = [];
+  let hover = -1, now = 0;
+  // colour layers: the settled base, then one expanding circle per click, newest last
+  const MAX_REVEALS = 8;
+  let base = pal;
+  const reveals = [];
+
+  addEventListener('pointermove', e => { mouse.x = e.clientX; mouse.y = e.clientY; mouse.on = 1; });
+  document.addEventListener('pointerleave', () => { mouse.on = 0; });
+  addEventListener('pointerdown', e => {
+    if (e.target.closest?.('a')) return;
+    recolor(e.clientX, e.clientY);
+    if (reduced) return;
+    waves.push({ x: e.clientX, y: e.clientY, t0: now });
+    if (waves.length > 5) waves.shift();
+  });
+
+  links.forEach((a, i) => {
+    const on = () => { hover = i; }, off = () => { if (hover === i) hover = -1; };
+    a.addEventListener('pointerenter', on); a.addEventListener('pointerleave', off);
+    a.addEventListener('focus', on); a.addEventListener('blur', off);
+  });
+
+  // a new hue rides outward on the ripple's leading edge; rapid clicks stack, each circle growing over the last
+  function recolor(px, py) {
+    paintHue(Math.round(hue + 60 + Math.random() * 240) % 360);   // always visibly different
+    pal = palette(hue);
+    if (reduced) { base = pal; reveals.length = 0; return; }
+    reveals.push({ x: px, y: py, t0: now, rad: 0, r: Math.hypot(Math.max(px, W - px), Math.max(py, H - py)), pal });
+    if (reveals.length > MAX_REVEALS) base = reveals.shift().pal;
+  }
+
+  // index of the colour layer showing at a point: 0 is the base, k + 1 is reveals[k]
+  const layerAt = (x, y) => {
+    for (let k = reveals.length - 1; k >= 0; k--) {
+      const rv = reveals[k];
+      if ((x - rv.x) ** 2 + (y - rv.y) ** 2 <= rv.rad * rv.rad) return k + 1;
+    }
+    return 0;
+  };
+  const layerPal = n => n ? reveals[n - 1].pal : base;
+
+  /* ---------- render ---------- */
+  // one string per (palette, brightness) per row: a handful of fillText calls instead of one per glyph
+  let bufs = [], used = [];
+  const rowBuffers = () => {
+    bufs = Array.from({ length: MAX_REVEALS + 1 }, () => [0, 1, 2].map(() => new Array(cols).fill(' ')));
+    used = Array.from({ length: MAX_REVEALS + 1 }, () => [0, 0, 0]);
+  };
+
+  let last = performance.now(), tiltX = 0, tiltY = 0;
+  function frame(ms) {
+    requestAnimationFrame(frame);
+    const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+    last = ms;
+    now += dt * (reduced ? 0.2 : 1);
+
+    mouse.s += (mouse.on - mouse.s) * Math.min(1, dt * 3);
+    // the banner leans away from the pointer; without one it slowly orbits on its own
+    const tx = mouse.on ? mouse.x / W - 0.5 : 0.35 * Math.cos(now * 0.4);
+    const ty = mouse.on ? mouse.y / H - 0.5 : 0.25 * Math.sin(now * 0.4);
+    tiltX += (tx - tiltX) * Math.min(1, dt * 4);
+    tiltY += (ty - tiltY) * Math.min(1, dt * 4);
+    while (waves.length && now - waves[0].t0 > 4) waves.shift();
+
+    // once a circle covers the screen it becomes the base, along with everything under it
+    for (const rv of reveals) rv.rad = SPEED * (now - rv.t0);
+    for (let k = reveals.length - 1; k >= 0; k--) {
+      if (reveals[k].rad > reveals[k].r) { base = reveals[k].pal; reveals.splice(0, k + 1); break; }
+    }
+
+    // 1. height of the surface at every cell: idle swell + pointer lens + click ripples
+    for (let j = 0, idx = 0; j < rows; j++) {
+      const py = (j + 0.5) * ch;
+      for (let i = 0; i < cols; i++, idx++) {
+        const px = (i + 0.5) * cw;
+        let hw = 0;
+        for (const w of waves) {
+          const age = now - w.t0;
+          const d = Math.hypot(px - w.x, py - w.y) - SPEED * age;
+          if (d > -420 && d < 140) hw += 11 * Math.exp(-age * 0.8) * Math.exp(-d * d / 9000) * Math.cos(d * 0.085);
+        }
+        const dx = px - mouse.x, dy = py - mouse.y;
+        const hm = mouse.s * 30 * Math.exp(-(dx * dx + dy * dy) / 9000);
+        const ha = 6 * Math.sin(px * 0.011 + now * 0.9) * Math.sin(py * 0.014 - now * 0.7);
+        Hwave[idx] = hw;
+        Hall[idx] = hw + hm + ha;
+      }
+    }
+
+    // 2. paint the background: base, then each reveal circle on top
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = base.bg;
+    ctx.fillRect(0, 0, W, H);
+    for (const rv of reveals) {
+      ctx.fillStyle = rv.pal.bg;
+      ctx.beginPath(); ctx.arc(rv.x, rv.y, rv.rad, 0, Math.PI * 2); ctx.fill();
+    }
+
+    if (bufs.length === 0 || bufs[0][0].length !== cols) rowBuffers();
+    const exX = -tiltX * 3.4, exY = -tiltY * 1.8;   // extrusion vector, in cells
+    const inverted = [];
+
+    // 3. every cell looks through the surface: refraction picks what it shows, the normal picks how bright
+    for (let j = 0, idx = 0; j < rows; j++) {
+      const py = (j + 0.5) * ch;
+      for (let i = 0; i < cols; i++, idx++) {
+        const px = (i + 0.5) * cw;
+        const l = i > 0 ? idx - 1 : idx, r = i < cols - 1 ? idx + 1 : idx;
+        const u = j > 0 ? idx - cols : idx, d = j < rows - 1 ? idx + cols : idx;
+        const gx = (Hall[r] - Hall[l]) / (2 * cw), gy = (Hall[d] - Hall[u]) / (2 * ch);
+        const spec = (-gx * LX - gy * LY + LZ) / Math.sqrt(gx * gx + gy * gy + 1) - LZ;
+
+        let chr = ' ', b = 0;
+
+        // small text only moves with click ripples, so links stay put under the cursor
+        const wgx = (Hwave[r] - Hwave[l]) / (2 * cw), wgy = (Hwave[d] - Hwave[u]) / (2 * ch);
+        const tu = Math.round(i - wgx * 22 / cw), tv = Math.round(j - wgy * 22 / ch);
+        const tIdx = tu >= 0 && tv >= 0 && tu < cols && tv < rows ? tv * cols + tu : -1;
+        const t = tIdx >= 0 ? textGrid[tIdx] : null;
+
+        if (t !== null) {
+          if (hitGrid[tIdx] >= 0 && hitGrid[tIdx] === hover) inverted.push(i, j, t);
+          else { chr = t; b = 2; }
+        } else {
+          const su = i + 0.5 - gx * 40 / cw, sv = j + 0.5 - gy * 40 / ch;
+          if (maskAt(su, sv)) {
+            chr = spec > 0.06 ? '@' : spec < -0.06 ? '%' : '#';
+            b = 2;
+          } else {
+            let k = 1;
+            while (k <= DEPTH && !maskAt(su - exX * k / DEPTH, sv - exY * k / DEPTH)) k++;
+            if (k <= DEPTH) {
+              chr = SIDE[k];
+              b = k <= 2 ? 1 : 0;
+            } else {
+              // the sea, in a slight perspective that follows the tilt
+              const x = (su * cw - W / 2) / unit, y = (sv * ch - H / 2) / unit;
+              const z = 1 + 0.5 * (x * tiltX + y * tiltY);
+              const v = field(x / z, y / z, now) + Math.max(0, spec) * 2.2;
+              chr = RAMP[Math.max(0, Math.min(9, Math.floor(v * 10)))];
+              b = spec > 0.12 ? 2 : spec > 0.04 ? 1 : 0;
+            }
+          }
+        }
+
+        if (chr !== ' ') {
+          const p = reveals.length ? layerAt(px, py) : 0;
+          bufs[p][b][i] = chr;
+          used[p][b] = 1;
+        }
+      }
+
+      for (let p = 0; p <= reveals.length; p++) {
+        for (let b = 0; b < 3; b++) {
+          if (!used[p][b]) continue;
+          ctx.globalAlpha = ALPHA[b];
+          ctx.fillStyle = layerPal(p).fg;
+          ctx.fillText(bufs[p][b].join(''), 0, j * ch);
+          bufs[p][b].fill(' ');
+          used[p][b] = 0;
+        }
+      }
+    }
+
+    // 4. the hovered or focused link, inverted
+    ctx.globalAlpha = 1;
+    for (let k = 0; k < inverted.length; k += 3) {
+      const i = inverted[k], j = inverted[k + 1];
+      const p = layerPal(layerAt((i + 0.5) * cw, (j + 0.5) * ch));
+      ctx.fillStyle = p.fg;
+      ctx.fillRect(i * cw - 0.5, j * ch, cw + 1, ch);
+      ctx.fillStyle = p.bg;
+      ctx.fillText(inverted[k + 2], i * cw, j * ch);
+    }
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
