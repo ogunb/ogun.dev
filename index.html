@@ -33,6 +33,11 @@
     background: var(--bg);
     color: var(--fg);
     font: 13px/1.5 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    /* taps only: no pinch-zoom, scroll or text selection fighting the canvas */
+    touch-action: none;
+    overscroll-behavior: none;
+    user-select: none;
+    -webkit-user-select: none;
   }
   body { height: 100dvh; cursor: crosshair; }
 
@@ -82,20 +87,28 @@
   const ctx = canvas.getContext('2d');
   const links = [...document.querySelectorAll('.hit')];
   const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const coarse = matchMedia('(pointer: coarse)').matches;   // phones and tablets
 
   const MONO = '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
   const NAME = 'Ogün Babacan';
   const RAMP = ' .:-=+*#%@';
-  const SIDE = ' #%+=-:..';      // banner extrusion, nearest layer first (index 0 unused)
-  const ALPHA = [0.2, 0.55, 1];   // dim, mid, bright
-  const SS = 2;                   // banner mask samples per cell
-  const DEPTH = 7;                // extrusion layers
-  const SPEED = 900;              // px/s: the ripple front and the colour reveal travel together
-  const LX = -0.45, LY = -0.55, LZ = 0.7;   // light from the top left
+  const SIDE = ' #%+=-:..';                  // banner extrusion, nearest layer first (index 0 unused)
+  const ALPHA = [coarse ? 0.15 : 0.2, 0.55, 1];   // dim, mid, bright
+  const SS = 2;                               // banner mask samples per cell
+  const DEPTH = 7;                            // extrusion layers
+  const SPEED = 900;                          // px/s: the ripple front and the colour reveal travel together
+  const LX = -0.45, LY = -0.55, LZ = 0.7;     // light from the top left
+  // phones run hot at 60 fps on a full-screen canvas; 30 is plenty there
+  const FRAME_MS = coarse ? 1000 / 30 : 0;
+  const MAX_WAVES = coarse ? 3 : 5;
+  const MAX_REVEALS = 4;
+  const TAP_GAP_MS = 120;                     // rapid multi-finger taps are folded together
 
   let pal = palette(hue);
   let W, H, unit, cw, ch, cols, rows;
   let textGrid, hitGrid, mask, mW, mH, Hall, Hwave, clockAt;
+  // per-column and per-row terms of the separable parts (swell and sea), refreshed every frame
+  let colA, colB, colS, rowA, rowB, rowS;
 
   /* ---------- layout: everything snaps to the character grid ---------- */
   const maskAt = (u, v) => {
@@ -103,18 +116,20 @@
     return mi >= 0 && mj >= 0 && mi < mW && mj < mH && mask[mj * mW + mi] === 1;
   };
 
-  // writes text into the grid with a blank cell either side so the sea never touches it
+  // writes text into the grid inside a blank halo, so the sea never crowds it
   function put(str, c, r, link = -1) {
-    if (r < 0 || r >= rows) return;
-    for (let k = -1; k <= str.length; k++) {
-      const cc = c + k;
-      if (cc < 0 || cc >= cols) continue;
-      const idx = r * cols + cc;
-      if (k === -1 || k === str.length) {
-        if (textGrid[idx] === null) textGrid[idx] = ' ';
-      } else {
-        textGrid[idx] = str[k];
-        hitGrid[idx] = link;
+    for (let rr = r - 1; rr <= r + 1; rr++) {
+      if (rr < 0 || rr >= rows) continue;
+      for (let k = -1; k <= str.length; k++) {
+        const cc = c + k;
+        if (cc < 0 || cc >= cols) continue;
+        const idx = rr * cols + cc;
+        if (rr === r && k >= 0 && k < str.length) {
+          textGrid[idx] = str[k];
+          hitGrid[idx] = link;
+        } else if (textGrid[idx] === null) {
+          textGrid[idx] = ' ';
+        }
       }
     }
   }
@@ -131,11 +146,13 @@
   setInterval(tick, 1000);
 
   function layout() {
+    // a page can report a 0×0 viewport for a moment (backgrounded tabs, some mobile reloads)
+    if (!innerWidth || !innerHeight) { setTimeout(layout, 100); return; }
     W = innerWidth; H = innerHeight; unit = Math.min(W, H);
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = W * dpr; canvas.height = H * dpr;
+    const dpr = Math.min(window.devicePixelRatio || 1, coarse ? 1.5 : 2);
+    canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    const fs = W < 640 ? 11 : 13;
+    const fs = W < 640 ? 12 : 13;
     ctx.font = `${fs}px ${MONO}`;
     ctx.textBaseline = 'top';
     cw = ctx.measureText('M').width;   // exact advance, so a row drawn as one string lines up with the cells
@@ -147,26 +164,31 @@
     hitGrid = new Int8Array(n).fill(-1);
     Hall = new Float32Array(n);
     Hwave = new Float32Array(n);
+    colA = new Float32Array(cols); colB = new Float32Array(cols); colS = new Float32Array(cols);
+    rowA = new Float32Array(rows); rowB = new Float32Array(rows); rowS = new Float32Array(rows);
+    bufs = Array.from({ length: MAX_REVEALS + 1 }, () => [0, 1, 2].map(() => new Array(cols).fill(' ')));
+    used = Array.from({ length: MAX_REVEALS + 1 }, () => [0, 0, 0]);
 
     const pad = Math.min(44, Math.max(16, W * 0.032));
     const mx = Math.max(2, Math.round(pad / cw)), my = Math.max(1, Math.round(pad / ch));
 
-    // the name, rasterised once into a mask at 2×2 samples per cell
-    // one line only when it can be tall enough to read; otherwise stack the two words
+    // the name, rasterised once into a mask at 2×2 samples per cell. When stacked (narrow or tall
+    // screens) the letters are condensed, so width stops being the limit and they can be twice as tall
     const lines = cols >= 72 && W / H > 1.25 ? [NAME] : NAME.split(' ');
+    const squeeze = lines.length > 1 ? 0.5 : 1;
     const mc = document.createElement('canvas');
     mW = cols * SS; mH = rows * SS;
     mc.width = mW; mc.height = mH;
     const m = mc.getContext('2d', { willReadFrequently: true });
     m.font = `800 100px ${MONO}`;
-    const widest = Math.max(...lines.map(l => m.measureText(l).width));
-    const F = Math.min(100 * (W - 2 * mx * cw - 4 * cw) / widest, H * 0.46 / lines.length, 260);
-    m.setTransform(SS / cw, 0, 0, SS / ch, 0, 0);
+    const widest = Math.max(...lines.map(l => m.measureText(l).width)) * squeeze;
+    const F = Math.min(100 * (W - 2 * mx * cw - 2 * cw) / widest, H * 0.4 / lines.length, 260);
+    m.setTransform(SS / cw * squeeze, 0, 0, SS / ch, 0, 0);
     m.font = `800 ${F}px ${MONO}`;
     m.fillStyle = '#fff';
     const lh = F * 0.95;
-    const top = H * 0.44 - lines.length * lh / 2;
-    lines.forEach((l, k) => m.fillText(l, mx * cw, top + k * lh + F * 0.78));
+    const top = H * 0.42 - lines.length * lh / 2;
+    lines.forEach((l, k) => m.fillText(l, mx * cw / squeeze, top + k * lh + F * 0.78));
     const px = m.getImageData(0, 0, mW, mH).data;
     mask = new Uint8Array(mW * mH);
     for (let i = 0; i < mask.length; i++) mask[i] = px[i * 4 + 3] > 110 ? 1 : 0;
@@ -185,41 +207,42 @@
       placeLink(i, label, c, lr);
       c += label.length + 3;
     });
-    const hint = 'click anywhere';
+    const hint = coarse ? 'tap anywhere' : 'click anywhere';
     if (cols - mx - hint.length > c + 2) put(hint, cols - mx - hint.length, lr);
   }
 
-  addEventListener('resize', layout);
+  // mobile browsers fire resize as the address bar slides; rebuild once things settle
+  let resizeTimer;
+  addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(layout, 150); });
+  let bufs = [], used = [];
   layout();
   if (document.fonts) {
     Promise.all([document.fonts.load(`800 100px ${MONO}`), document.fonts.load(`13px ${MONO}`)]).then(layout, () => {});
   }
 
-  /* ---------- the sea behind everything ---------- */
-  function field(x, y, t) {
-    const a = Math.sin(x * 4.2 + t * 0.35 + 2 * Math.sin(y * 3.1 - t * 0.25));
-    const b = Math.sin(y * 5.0 - t * 0.30 + 1.5 * Math.sin(x * 2.6 + t * 0.2));
-    const v = a * b * 0.5 + 0.5;
-    return v * v * v * v * 0.8;
-  }
-
   /* ---------- input ---------- */
   const mouse = { x: -1e4, y: -1e4, on: 0, s: 0 };
   const waves = [];
-  let hover = -1, now = 0;
-  // colour layers: the settled base, then one expanding circle per click, newest last
-  const MAX_REVEALS = 8;
+  let hover = -1, now = 0, lastTap = -1e9;
+  // colour layers: the settled base, then one expanding circle per tap, newest last
   let base = pal;
   const reveals = [];
 
   addEventListener('pointermove', e => { mouse.x = e.clientX; mouse.y = e.clientY; mouse.on = 1; });
   document.addEventListener('pointerleave', () => { mouse.on = 0; });
+  // a lifted finger leaves no hover behind
+  const lift = e => { if (e.pointerType !== 'mouse') mouse.on = 0; };
+  addEventListener('pointerup', lift);
+  addEventListener('pointercancel', lift);
   addEventListener('pointerdown', e => {
     if (e.target.closest?.('a')) return;
+    const t = performance.now();
+    if (t - lastTap < TAP_GAP_MS) return;
+    lastTap = t;
     recolor(e.clientX, e.clientY);
     if (reduced) return;
     waves.push({ x: e.clientX, y: e.clientY, t0: now });
-    if (waves.length > 5) waves.shift();
+    if (waves.length > MAX_WAVES) waves.shift();
   });
 
   links.forEach((a, i) => {
@@ -228,7 +251,7 @@
     a.addEventListener('focus', on); a.addEventListener('blur', off);
   });
 
-  // a new hue rides outward on the ripple's leading edge; rapid clicks stack, each circle growing over the last
+  // a new hue rides outward on the ripple's leading edge; rapid taps stack, each circle growing over the last
   function recolor(px, py) {
     paintHue(Math.round(hue + 60 + Math.random() * 240) % 360);   // always visibly different
     pal = palette(hue);
@@ -248,16 +271,11 @@
   const layerPal = n => n ? reveals[n - 1].pal : base;
 
   /* ---------- render ---------- */
-  // one string per (palette, brightness) per row: a handful of fillText calls instead of one per glyph
-  let bufs = [], used = [];
-  const rowBuffers = () => {
-    bufs = Array.from({ length: MAX_REVEALS + 1 }, () => [0, 1, 2].map(() => new Array(cols).fill(' ')));
-    used = Array.from({ length: MAX_REVEALS + 1 }, () => [0, 0, 0]);
-  };
-
-  let last = performance.now(), tiltX = 0, tiltY = 0;
+  let last = performance.now(), lastDraw = -1e9, tiltX = 0, tiltY = 0;
   function frame(ms) {
     requestAnimationFrame(frame);
+    if (!Hall || ms - lastDraw < FRAME_MS - 2) return;
+    lastDraw = ms;
     const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
     last = ms;
     now += dt * (reduced ? 0.2 : 1);
@@ -276,22 +294,55 @@
       if (reveals[k].rad > reveals[k].r) { base = reveals[k].pal; reveals.splice(0, k + 1); break; }
     }
 
-    // 1. height of the surface at every cell: idle swell + pointer lens + click ripples
+    // 0. separable terms: a handful of sines per row and per column instead of per cell
+    for (let i = 0; i < cols; i++) {
+      const px = (i + 0.5) * cw, x = (px - W / 2) / unit;
+      colA[i] = x * 4.2 + now * 0.35;
+      colB[i] = 1.5 * Math.sin(x * 2.6 + now * 0.2);
+      colS[i] = Math.sin(px * 0.011 + now * 0.9);
+    }
+    for (let j = 0; j < rows; j++) {
+      const py = (j + 0.5) * ch, y = (py - H / 2) / unit;
+      rowA[j] = 2 * Math.sin(y * 3.1 - now * 0.25);
+      rowB[j] = y * 5.0 - now * 0.30;
+      rowS[j] = 6 * Math.sin(py * 0.014 - now * 0.7);
+    }
+
+    // 1. height of the surface: idle swell everywhere, then the pointer lens and ripples only where they reach
     for (let j = 0, idx = 0; j < rows; j++) {
-      const py = (j + 0.5) * ch;
-      for (let i = 0; i < cols; i++, idx++) {
-        const px = (i + 0.5) * cw;
-        let hw = 0;
-        for (const w of waves) {
-          const age = now - w.t0;
-          const d = Math.hypot(px - w.x, py - w.y) - SPEED * age;
-          if (d > -420 && d < 140) hw += 11 * Math.exp(-age * 0.8) * Math.exp(-d * d / 9000) * Math.cos(d * 0.085);
+      for (let i = 0; i < cols; i++, idx++) Hall[idx] = colS[i] * rowS[j];
+    }
+    if (mouse.s > 0.01) {
+      const R = 280;
+      const i0 = Math.max(0, Math.floor((mouse.x - R) / cw)), i1 = Math.min(cols - 1, Math.ceil((mouse.x + R) / cw));
+      const j0 = Math.max(0, Math.floor((mouse.y - R) / ch)), j1 = Math.min(rows - 1, Math.ceil((mouse.y + R) / ch));
+      for (let j = j0; j <= j1; j++) {
+        const dy = (j + 0.5) * ch - mouse.y;
+        for (let i = i0; i <= i1; i++) {
+          const dx = (i + 0.5) * cw - mouse.x;
+          Hall[j * cols + i] += mouse.s * 30 * Math.exp(-(dx * dx + dy * dy) / 9000);
         }
-        const dx = px - mouse.x, dy = py - mouse.y;
-        const hm = mouse.s * 30 * Math.exp(-(dx * dx + dy * dy) / 9000);
-        const ha = 6 * Math.sin(px * 0.011 + now * 0.9) * Math.sin(py * 0.014 - now * 0.7);
-        Hwave[idx] = hw;
-        Hall[idx] = hw + hm + ha;
+      }
+    }
+    const rippling = waves.length > 0;
+    if (rippling) {
+      Hwave.fill(0);
+      for (const w of waves) {
+        const age = now - w.t0, front = SPEED * age, amp = 11 * Math.exp(-age * 0.8);
+        const inner = Math.max(0, front - 420), outer = front + 140;
+        const in2 = inner * inner, out2 = outer * outer;
+        for (let j = 0, idx = 0; j < rows; j++) {
+          const dy = (j + 0.5) * ch - w.y, dy2 = dy * dy;
+          if (dy2 > out2) { idx += cols; continue; }
+          for (let i = 0; i < cols; i++, idx++) {
+            const dx = (i + 0.5) * cw - w.x, r2 = dx * dx + dy2;
+            if (r2 < in2 || r2 > out2) continue;
+            const d = Math.sqrt(r2) - front;
+            const h = amp * Math.exp(-d * d / 9000) * Math.cos(d * 0.085);
+            Hwave[idx] += h;
+            Hall[idx] += h;
+          }
+        }
       }
     }
 
@@ -304,7 +355,6 @@
       ctx.beginPath(); ctx.arc(rv.x, rv.y, rv.rad, 0, Math.PI * 2); ctx.fill();
     }
 
-    if (bufs.length === 0 || bufs[0][0].length !== cols) rowBuffers();
     const exX = -tiltX * 3.4, exY = -tiltY * 1.8;   // extrusion vector, in cells
     const inverted = [];
 
@@ -320,10 +370,13 @@
 
         let chr = ' ', b = 0;
 
-        // small text only moves with click ripples, so links stay put under the cursor
-        const wgx = (Hwave[r] - Hwave[l]) / (2 * cw), wgy = (Hwave[d] - Hwave[u]) / (2 * ch);
-        const tu = Math.round(i - wgx * 22 / cw), tv = Math.round(j - wgy * 22 / ch);
-        const tIdx = tu >= 0 && tv >= 0 && tu < cols && tv < rows ? tv * cols + tu : -1;
+        // small text only moves with ripples, so links stay put under a finger or cursor
+        let tIdx = idx;
+        if (rippling) {
+          const tu = Math.round(i - (Hwave[r] - Hwave[l]) / (2 * cw) * 22 / cw);
+          const tv = Math.round(j - (Hwave[d] - Hwave[u]) / (2 * ch) * 22 / ch);
+          tIdx = tu >= 0 && tv >= 0 && tu < cols && tv < rows ? tv * cols + tu : -1;
+        }
         const t = tIdx >= 0 ? textGrid[tIdx] : null;
 
         if (t !== null) {
@@ -341,10 +394,10 @@
               chr = SIDE[k];
               b = k <= 2 ? 1 : 0;
             } else {
-              // the sea, in a slight perspective that follows the tilt
-              const x = (su * cw - W / 2) / unit, y = (sv * ch - H / 2) / unit;
-              const z = 1 + 0.5 * (x * tiltX + y * tiltY);
-              const v = field(x / z, y / z, now) + Math.max(0, spec) * 2.2;
+              // the sea: lit by the surface, but not refracted, so it stays two sines per cell
+              const a = Math.sin(colA[i] + rowA[j]), bb = Math.sin(rowB[j] + colB[i]);
+              let v = a * bb * 0.5 + 0.5;
+              v = v * v * v * v * 0.8 + Math.max(0, spec) * 2.2;
               chr = RAMP[Math.max(0, Math.min(9, Math.floor(v * 10)))];
               b = spec > 0.12 ? 2 : spec > 0.04 ? 1 : 0;
             }
