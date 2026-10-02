@@ -7,19 +7,19 @@
 <meta name="description" content="Ogün Babacan — developing stuff at Trendyol GO.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,800;1,400&display=swap" rel="stylesheet">
 <script>
-  // one hue drives every colour; OKLCH keeps lightness, and so contrast, the same whatever the hue
-  window.palette = h => ({
-    bg: `oklch(0.17 0.035 ${h})`,
-    fg: `oklch(0.86 0.13 ${h})`
-  });
-  window.paintHue = h => {
-    const s = document.documentElement.style, p = palette(h);
+  // black and white: ink on paper or light on dark, and every tap flips one into the other.
+  // ac is for links, a step past the text so they lift off everything else
+  window.palette = inv => inv
+    ? { bg: '#f1f1ee', fg: '#1b1b1b', ac: '#000' }
+    : { bg: '#0b0b0b', fg: '#e4e4e4', ac: '#fff' };
+  window.paint = inv => {
+    const s = document.documentElement.style, p = palette(inv);
     for (const k in p) s.setProperty('--' + k, p[k]);
-    window.hue = h;
+    window.inv = inv;
   };
-  paintHue(Math.floor(Math.random() * 360));
+  paint(false);
 </script>
 <style>
   :root {
@@ -91,11 +91,21 @@
 
   const MONO = '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
   const NAME = 'Ogün Babacan';
-  const RAMP = ' .:-=+*#%@';
-  const SIDE = ' #%+=-:..';                  // banner extrusion, nearest layer first (index 0 unused)
-  const ALPHA = [coarse ? 0.15 : 0.2, 0.55, 1];   // dim, mid, bright
+  const SIDE = ' :::-...';                   // banner extrusion, nearest layer first (index 0 unused)
+  // every glyph is drawn in one of these: the background's three brightnesses, then the small text's
+  // voices (w: b bold, i italic; c: palette colour). Text keys are named for put()
+  const STYLES = [
+    { a: coarse ? 0.18 : 0.2 }, { a: 0.55 }, { a: 1 },
+    { a: 1, w: 'b' },               // 3 head: what matters in a line
+    { a: 0.6, w: 'i' },             // 4 aside: the words around it
+    { a: 0.38 },                    // 5 rule: numbers and punctuation
+    { a: 1, w: 'b', c: 'ac' }       // 6 link
+  ];
+  const HEAD = 3, ASIDE = 4, RULE = 5, LINK = 6;
   const SS = 2;                               // banner mask samples per cell
   const DEPTH = 7;                            // extrusion layers
+  const LANE = 3.4;                           // rows between streamlines
+  const ROCK = 0.11;                          // radius of the rock under the pointer, in screen heights
   const SPEED = 900;                          // px/s: the ripple front and the colour reveal travel together
   const LX = -0.45, LY = -0.55, LZ = 0.7;     // light from the top left
   // phones run hot at 60 fps on a full-screen canvas; 30 is plenty there
@@ -103,12 +113,14 @@
   const MAX_WAVES = coarse ? 3 : 5;
   const MAX_REVEALS = 4;
   const TAP_GAP_MS = 120;                     // rapid multi-finger taps are folded together
+  const SCENE_SECS = 9;                       // how long each background plays before the next
+  const FADE_SECS = 1.4;                      // the dissolve between two backgrounds
 
-  let pal = palette(hue);
-  let W, H, unit, cw, ch, cols, rows;
-  let textGrid, hitGrid, mask, mW, mH, Hall, Hwave, clockAt;
-  // per-column and per-row terms of the separable parts (swell and sea), refreshed every frame
-  let colA, colB, colS, rowA, rowB, rowS;
+  let pal = palette(inv);
+  let W, H, unit, cw, ch, cols, rows, fonts;
+  let textGrid, styleGrid, hitGrid, mask, calm, thr, mW, mH, Hall, Hwave, Q, clockAt, labelAt;
+  // per-column and per-row terms (swell, and positions in screen heights), refreshed every frame
+  let colX, colS, rowY, rowS;
 
   /* ---------- layout: everything snaps to the character grid ---------- */
   const maskAt = (u, v) => {
@@ -116,8 +128,8 @@
     return mi >= 0 && mj >= 0 && mi < mW && mj < mH && mask[mj * mW + mi] === 1;
   };
 
-  // writes text into the grid inside a blank halo, so the sea never crowds it
-  function put(str, c, r, link = -1) {
+  // writes text into the grid inside a blank halo, so the river never crowds it
+  function put(str, c, r, style = HEAD, link = -1) {
     for (let rr = r - 1; rr <= r + 1; rr++) {
       if (rr < 0 || rr >= rows) continue;
       for (let k = -1; k <= str.length; k++) {
@@ -126,23 +138,33 @@
         const idx = rr * cols + cc;
         if (rr === r && k >= 0 && k < str.length) {
           textGrid[idx] = str[k];
+          styleGrid[idx] = style;
           hitGrid[idx] = link;
         } else if (textGrid[idx] === null) {
           textGrid[idx] = ' ';
         }
       }
     }
+    return c + str.length;
   }
 
+  // a line in several voices, e.g. [['istanbul ', ASIDE], ['01:21', HEAD]]; returns the column after it
+  const putLine = (parts, c, r) => parts.reduce((cc, [str, style]) => put(str, cc, r, style), c);
+  const lineLength = parts => parts.reduce((n, [str]) => n + str.length, 0);
+
   function placeLink(i, label, c, r) {
-    put(label, c, r, i);
+    put(label, c, r, LINK, i);
+    // on touch screens the target reaches into the blank halo above and below, for a fingertip
+    const grow = coarse ? ch * 0.75 : 0;
     Object.assign(links[i].style, {
-      left: c * cw + 'px', top: r * ch + 'px', width: label.length * cw + 'px', height: ch + 'px'
+      left: c * cw + 'px', top: r * ch - grow + 'px', width: label.length * cw + 'px', height: ch + 2 * grow + 'px'
     });
   }
 
   const time = () => new Date().toLocaleTimeString('en-GB', { timeZone: 'Europe/Istanbul', hour12: false });
-  const tick = () => { if (clockAt) put(`Istanbul, TR ${time()}`, clockAt.c, clockAt.r); };
+  // hours and minutes carry the line; the seconds tick by quietly
+  const clock = () => { const t = time(); return [['istanbul ', ASIDE], [t.slice(0, 5), HEAD], [t.slice(5), RULE]]; };
+  const tick = () => { if (clockAt) putLine(clock(), clockAt.c, clockAt.r); };
   setInterval(tick, 1000);
 
   function layout() {
@@ -152,8 +174,10 @@
     const dpr = Math.min(window.devicePixelRatio || 1, coarse ? 1.5 : 2);
     canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    const fs = W < 640 ? 12 : 13;
-    ctx.font = `${fs}px ${MONO}`;
+    const fs = W < 640 ? 14 : 13;   // phones get the larger grid: fewer, more legible cells
+    const reg = `${fs}px ${MONO}`;
+    fonts = STYLES.map(st => st.w === 'b' ? `800 ${fs}px ${MONO}` : st.w === 'i' ? `italic ${fs}px ${MONO}` : reg);
+    ctx.font = reg;
     ctx.textBaseline = 'top';
     cw = ctx.measureText('M').width;   // exact advance, so a row drawn as one string lines up with the cells
     ch = Math.round(fs * 1.3);
@@ -161,13 +185,15 @@
 
     const n = cols * rows;
     textGrid = new Array(n).fill(null);
+    styleGrid = new Uint8Array(n);
     hitGrid = new Int8Array(n).fill(-1);
     Hall = new Float32Array(n);
     Hwave = new Float32Array(n);
-    colA = new Float32Array(cols); colB = new Float32Array(cols); colS = new Float32Array(cols);
-    rowA = new Float32Array(rows); rowB = new Float32Array(rows); rowS = new Float32Array(rows);
-    bufs = Array.from({ length: MAX_REVEALS + 1 }, () => [0, 1, 2].map(() => new Array(cols).fill(' ')));
-    used = Array.from({ length: MAX_REVEALS + 1 }, () => [0, 0, 0]);
+    Q = new Float32Array(n);
+    colX = new Float32Array(cols); colS = new Float32Array(cols);
+    rowY = new Float32Array(rows); rowS = new Float32Array(rows);
+    bufs = Array.from({ length: MAX_REVEALS + 1 }, () => STYLES.map(() => new Array(cols).fill(' ')));
+    used = Array.from({ length: MAX_REVEALS + 1 }, () => STYLES.map(() => 0));
 
     const pad = Math.min(44, Math.max(16, W * 0.032));
     const mx = Math.max(2, Math.round(pad / cw)), my = Math.max(1, Math.round(pad / ch));
@@ -193,22 +219,264 @@
     mask = new Uint8Array(mW * mH);
     for (let i = 0; i < mask.length; i++) mask[i] = px[i * 4 + 3] > 110 ? 1 : 0;
 
+    // calm water round the name, two cells either side and one above and below, so it reads cleanly
+    calm = new Uint8Array(n);
+    for (let j = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++) {
+        if (!maskAt(i + 0.25, j + 0.25) && !maskAt(i + 0.75, j + 0.25) && !maskAt(i + 0.25, j + 0.75) && !maskAt(i + 0.75, j + 0.75)) continue;
+        for (let jj = Math.max(0, j - 1); jj <= Math.min(rows - 1, j + 1); jj++) {
+          for (let ii = Math.max(0, i - 2); ii <= Math.min(cols - 1, i + 2); ii++) calm[jj * cols + ii] = 1;
+        }
+      }
+    }
+
     // small text
-    put('ogun.dev', mx, my);
-    clockAt = { c: cols - mx - 21, r: my };
+    labelAt = { c: mx, r: my };
+    label();
+    clockAt = { c: cols - mx - lineLength(clock()), r: my };
     tick();
     const roleRow = Math.min(rows - my - 4, Math.ceil((top + lines.length * lh) / ch) + 2);
-    put('developing stuff @ ', mx, roleRow);
-    placeLink(0, 'Trendyol GO', mx + 19, roleRow);
+    placeLink(0, 'Trendyol GO', put('developing stuff at ', mx, roleRow, ASIDE), roleRow);
     const lr = rows - 1 - my;
     let c = mx;
-    // » rather than an arrow: the font subset has no arrows, and a fallback glyph would break the grid
-    [['github »', 1], ['linkedin »', 2], ['email »', 3]].forEach(([label, i]) => {
-      placeLink(i, label, c, lr);
-      c += label.length + 3;
+    ['github', 'linkedin', 'email'].forEach((label, k) => {
+      c = put(`0${k + 1} `, c, lr, RULE);
+      placeLink(k + 1, label, c, lr);
+      c += label.length + 4;
     });
     const hint = coarse ? 'tap anywhere' : 'click anywhere';
-    if (cols - mx - hint.length > c + 2) put(hint, cols - mx - hint.length, lr);
+    if (cols - mx - hint.length > c + 2) put(hint, cols - mx - hint.length, lr, ASIDE);
+
+    // the order cells switch in during a dissolve: a diagonal sweep, broken up by noise
+    thr = new Float32Array(n);
+    for (let j = 0, idx = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++, idx++) thr[idx] = 0.6 * (0.6 * i / cols + 0.4 * j / rows) + 0.38 * hash(i, j);
+    }
+    for (const sc of Object.values(SCENES)) sc.layout?.();
+  }
+
+  /* ---------- backgrounds ---------- */
+  // Every scene draws only the cells the name and text leave free. cell() returns a glyph and sets
+  // `cb`, its brightness (0 dim, 1 mid, 2 bright). Scenes other than the river look through the
+  // surface, so ripples refract them: they sample the cell the surface slope points at.
+  const hash = (i, j) => { const h = Math.sin(i * 12.9898 + j * 78.233) * 43758.5453; return h - Math.floor(h); };
+  const RAMP = ' .:-=+*#%@';
+  let cb = 0;
+  const refrI = (i, gx) => Math.min(cols - 1, Math.max(0, Math.round(i - gx * 40 / cw)));
+  const refrJ = (j, gy) => Math.min(rows - 1, Math.max(0, Math.round(j - gy * 40 / ch)));
+  const glint = spec => spec > 0.12 ? 2 : spec > 0.04 ? 1 : 0;
+
+  const river = {
+    // a stream function, so its level lines are the paths the water takes. Slow meanders pinch and
+    // widen the lanes, the pointer is a rock the flow parts around (potential flow past a cylinder),
+    // and ripples push the lanes about. Q is in lanes, one per LANE rows
+    prep() {
+      const lanes = rows / LANE;
+      const rx = (mouse.x - W / 2) / H, ry = (mouse.y - H / 2) / H, rock = mouse.s * ROCK * ROCK;
+      for (let j = 0, idx = 0; j < rows; j++) {
+        const y = rowY[j];
+        for (let i = 0; i < cols; i++, idx++) {
+          const x = colX[i];
+          let psi = y + 0.055 * Math.sin(x * 3.6 - now * 0.18 + y * 2.2) + 0.025 * Math.sin(x * 8.3 + now * 0.11 - y * 3.1);
+          if (rock > 1e-5) {
+            const dx = x - rx, dy = y - ry;
+            psi -= dy * Math.min(1, rock / (dx * dx + dy * dy));
+            // a wake: the lanes behind the rock shiver, fading downstream
+            if (dx > 0) psi += mouse.s * 0.35 / lanes * Math.sin(dx * 38 - now * 5) * Math.exp(-dx * 5 - dy * dy / (rock * 2.5));
+          }
+          Q[idx] = psi * lanes + (waves.length ? Hwave[idx] * 0.12 : 0);
+        }
+      }
+      this.rockX = mouse.x; this.rockY = mouse.y; this.rockR2 = (mouse.s * ROCK * H) ** 2;
+    },
+    cell(i, j, idx, px, py, spec, l, r, u, d) {
+      // a streamline passes through this cell if its lane is within half a cell along the steeper
+      // axis (one glyph thick), drawn with the glyph closest to its direction
+      const q = Q[idx], qi = (Q[r] - Q[l]) / 2, qj = (Q[d] - Q[u]) / 2;
+      const lvl = Math.round(q), ai = Math.abs(qi), aj = Math.abs(qj);
+      const dxr = px - this.rockX, dyr = py - this.rockY, rr = (dxr * dxr + dyr * dyr) / this.rockR2;
+      const inRock = rr < 1, nearRock = rr < 9;
+      // every lane carries dashes of current downstream, at its own speed and spacing; by the rock
+      // they run unbroken, so the bend reads
+      const v = 55 + 35 * Math.sin(lvl * 2.39), P = 150 + 90 * (0.5 + 0.5 * Math.sin(lvl * 1.37));
+      const seg = ((px - now * v + lvl * 97) % P + P) % P;
+      if (inRock) {
+        // foam churning round the rim, heaviest where the water strikes it
+        const h = Math.sin(i * 12.9898 + j * 78.233 + Math.floor(now * 9) * 3.17) * 43758.5453;
+        if (rr > 0.55 && h - Math.floor(h) < (dxr < 0 ? 0.7 : 0.35)) {
+          cb = dxr < 0 ? 2 : 1;
+          return rr > 0.8 ? '~' : '°';
+        }
+        return ' ';
+      }
+      if (Math.abs(q - lvl) < 0.5 * Math.max(ai, aj) && (nearRock || seg < P * 0.72)) {
+        // the leading end of a dash, and water squeezed past the rock, catch the light
+        const head = seg > P * 0.72 - 2 * cw, rapid = Math.max(ai, aj) > 0.5 / LANE * 1.7;
+        cb = Math.min(2, (head ? 1 : 0) + (rapid ? 1 : 0) + (spec > 0.1 ? 2 : spec > 0.03 ? 1 : 0));
+        if (ai < aj * 0.6) {
+          // flat runs: pick the glyph by where in the cell the line sits, so slopes step smoothly
+          const off = (lvl - q) / qj;
+          return off > 0.2 ? '_' : off < -0.2 ? '¯' : '-';
+        }
+        return aj < ai * 0.42 ? '|' : qi * qj > 0 ? '/' : '\\';
+      }
+      // flecks drifting with the current
+      return hash(Math.floor((px - now * 48) / cw), j) < 0.012 ? '.' : ' ';
+    }
+  };
+
+  // the original: two interfering sine sheets, sharpened so most of it is dark
+  const sea = {
+    layout() {
+      this.ca = new Float32Array(cols); this.cb = new Float32Array(cols);
+      this.ra = new Float32Array(rows); this.rb = new Float32Array(rows);
+    },
+    prep() {
+      for (let i = 0; i < cols; i++) { const x = colX[i]; this.ca[i] = x * 4.2 + now * 0.35; this.cb[i] = 1.5 * Math.sin(x * 2.6 + now * 0.2); }
+      for (let j = 0; j < rows; j++) { const y = rowY[j]; this.ra[j] = 2 * Math.sin(y * 3.1 - now * 0.25); this.rb[j] = y * 5.0 - now * 0.30; }
+    },
+    cell(i, j, idx, px, py, spec, l, r, u, d, gx, gy) {
+      const si = refrI(i, gx), sj = refrJ(j, gy);
+      let v = Math.sin(this.ca[si] + this.ra[sj]) * Math.sin(this.rb[sj] + this.cb[si]) * 0.5 + 0.5;
+      v = v * v * v * v * 0.8 + Math.max(0, spec) * 2.2;
+      cb = glint(spec);
+      return RAMP[Math.max(0, Math.min(9, Math.floor(v * 10)))];
+    }
+  };
+
+  // a retro sunset: striped sun behind a mountain ridge, a perspective grid floor running at you
+  const terrain = {
+    layout() {
+      this.hy = Math.round(rows * 0.6);
+      this.z = new Float32Array(rows + 1);
+      for (let j = this.hy + 1; j <= rows; j++) this.z[j] = (rows - this.hy) / (j - this.hy + 0.5);
+      this.m = new Float32Array(cols);
+      for (let i = 0; i < cols; i++) {
+        const x = ((i + 0.5) * cw - W / 2) / H;
+        this.m[i] = rows * 0.13 * (0.55 + 0.25 * Math.sin(x * 9.1 + 2) + 0.2 * Math.sin(x * 23.7 + 1));
+      }
+    },
+    prep() {
+      this.cx = W / 2 - tiltX * W * 0.08;
+      this.cy = (this.hy - rows * 0.11) * ch;
+      this.R = unit * 0.17;
+      this.scroll = now * 2.2;
+      this.lean = tiltX * 0.2;
+    },
+    cell(i, j, idx, px, py, spec, l, r, u, d, gx, gy) {
+      const si = refrI(i, gx), sj = refrJ(j, gy), hy = this.hy;
+      if (sj > hy) {
+        // a grid line crosses this cell if the floor coordinate rolls over between neighbouring cells
+        const z = this.z[sj], zn = this.z[sj + 1] || z;
+        const Z = z + this.scroll, Zn = zn + this.scroll;
+        const X = (colX[si] + this.lean) * z * 7, Xn = ((si + 1 < cols ? colX[si + 1] : colX[si]) + this.lean) * z * 7;
+        const hl = Math.floor(Z) !== Math.floor(Zn), vl = Math.floor(X) !== Math.floor(Xn);
+        cb = Math.max(glint(spec), z < 2.2 ? 1 : 0);
+        if (hl && vl) return '+';
+        if (hl) return '-';
+        if (vl) return Math.abs(X) < z * 0.35 ? '|' : X < 0 ? '/' : '\\';
+        return spec > 0.06 ? '.' : ' ';
+      }
+      if (sj === hy) { cb = 1; return '='; }
+      const up = hy - sj, m = this.m[si];
+      if (up < m) {
+        // only the ridge is drawn, sloped to match its neighbours
+        if (up < m - 1) return ' ';
+        const a = si > 0 ? this.m[si - 1] : m, b = si + 1 < cols ? this.m[si + 1] : m;
+        cb = 1;
+        return a < m - 0.5 && b < m - 0.5 ? '^' : a < b ? '/' : b < a ? '\\' : '-';
+      }
+      const dx = px - this.cx, dy = py - this.cy;
+      if (dx * dx + dy * dy < this.R * this.R) {
+        // the sun's slits widen toward the horizon
+        const k = (dy + this.R) / (2 * this.R);
+        if (k > 0.45 && j % (k > 0.75 ? 2 : 3) === 0) return ' ';
+        cb = 1;
+        return '=';
+      }
+      const h = hash(si, sj);
+      if (h > 0.992) { cb = Math.sin(now * 2 + h * 900) > 0.6 ? 1 : 0; return h > 0.997 ? '*' : '.'; }
+      return ' ';
+    }
+  };
+
+  // a warp: stars stream out of a vanishing point that follows the pointer
+  const stars = {
+    layout() {
+      const N = Math.min(520, Math.floor(cols * rows / 12));
+      this.x = new Float32Array(N); this.y = new Float32Array(N); this.z = new Float32Array(N);
+      for (let k = 0; k < N; k++) this.spawn(k, 0.1 + 0.9 * Math.random());
+      this.g = new Float32Array(cols * rows);
+    },
+    spawn(k, z) { this.x[k] = Math.random() * 2 - 1; this.y[k] = Math.random() * 2 - 1; this.z[k] = z; },
+    plot(px, py, v) {
+      const i = Math.floor(px / cw), j = Math.floor(py / ch);
+      if (i >= 0 && j >= 0 && i < cols && j < rows && v > this.g[j * cols + i]) this.g[j * cols + i] = v;
+    },
+    prep(dt) {
+      this.g.fill(0);
+      const vx = W / 2 + tiltX * W * 0.5, vy = H / 2 + tiltY * H * 0.5, s = unit * 0.45;
+      for (let k = 0; k < this.z.length; k++) {
+        const z = this.z[k] - dt * 0.32;
+        if (z < 0.04) { this.spawn(k, 1); continue; }
+        this.z[k] = z;
+        const px = vx + this.x[k] / z * s, py = vy + this.y[k] / z * s;
+        if (px < 0 || py < 0 || px > W || py > H) { this.spawn(k, 1); continue; }
+        const v = Math.min(1, (1 - z) * 1.25);
+        this.plot(px, py, v);
+        // a short streak back toward the vanishing point, longer as the star closes in
+        const z2 = z + 0.06;
+        this.plot(vx + this.x[k] / z2 * s, vy + this.y[k] / z2 * s, v * 0.45);
+      }
+    },
+    cell(i, j, idx, px, py, spec, l, r, u, d, gx, gy) {
+      const v = this.g[refrJ(j, gy) * cols + refrI(i, gx)] + Math.max(0, spec) * 1.5;
+      cb = v > 0.8 ? 2 : v > 0.45 ? 1 : 0;
+      return v > 0.8 ? '@' : v > 0.55 ? '*' : v > 0.3 ? '+' : v > 0.12 ? '.' : ' ';
+    }
+  };
+
+  // falling columns of characters: near drops bright, long and fast, far ones dim, short and slow
+  const GLYPHS = 'abcdefghijklmnopqrstuvwxyz0123456789$+-*/=%#&<>?!';
+  const rain = {
+    layout() {
+      const N = cols * 2;   // two drops share each column
+      this.h = new Float32Array(N); this.v = new Float32Array(N); this.len = new Float32Array(N); this.dep = new Float32Array(N);
+      for (let k = 0; k < N; k++) this.drop(k, Math.random() * rows * 1.5 - rows * 0.5);
+    },
+    drop(k, h) {
+      const dep = 0.25 + 0.75 * Math.random();
+      this.dep[k] = dep; this.h[k] = h; this.v[k] = 6 + 20 * dep; this.len[k] = 3 + 14 * dep;
+    },
+    prep(dt) {
+      for (let k = 0; k < this.h.length; k++) {
+        this.h[k] += this.v[k] * dt;
+        if (this.h[k] - this.len[k] > rows) this.drop(k, -Math.random() * rows * 0.6);
+      }
+    },
+    cell(i, j, idx, px, py, spec, l, r, u, d, gx, gy) {
+      const si = refrI(i, gx), sj = refrJ(j, gy);
+      let best = 0, head = false;
+      for (let k = si * 2; k < si * 2 + 2; k++) {
+        const dd = this.h[k] - sj;
+        if (dd < 0 || dd >= this.len[k]) continue;
+        const v = this.dep[k] * (dd < 1 ? 1 : 0.8 * (1 - dd / this.len[k]));
+        if (v > best) { best = v; head = dd < 1; }
+      }
+      if (best < 0.08) return spec > 0.08 ? '.' : ' ';
+      cb = Math.max(glint(spec), head ? 2 : best > 0.5 ? 1 : 0);
+      // each glyph flickers to another now and then
+      return GLYPHS[Math.floor(hash(si, Math.floor(now * 7 + si * 0.37 + sj * 0.13)) * GLYPHS.length)];
+    }
+  };
+
+  const SCENES = { river, sea, terrain, stars, rain };
+  const NAMES = Object.keys(SCENES);
+  // a different background on every visit, and another every SCENE_SECS while the page is open
+  const pick = not => { let n; do n = NAMES[Math.floor(Math.random() * NAMES.length)]; while (n === not); return n; };
+  let sceneName = pick(), nextName = null, fadeT0 = 0, sceneUntil = performance.now() / 1000 + SCENE_SECS;
+  function label() {
+    if (labelAt) putLine([['ogun.dev', HEAD], [' / ', RULE], [(nextName || sceneName).padEnd(7), ASIDE]], labelAt.c, labelAt.r);
   }
 
   // mobile browsers fire resize as the address bar slides; rebuild once things settle
@@ -217,7 +485,8 @@
   let bufs = [], used = [];
   layout();
   if (document.fonts) {
-    Promise.all([document.fonts.load(`800 100px ${MONO}`), document.fonts.load(`13px ${MONO}`)]).then(layout, () => {});
+    Promise.all([`800 100px ${MONO}`, `14px ${MONO}`, `italic 14px ${MONO}`]
+      .map(f => document.fonts.load(f))).then(layout, () => {});
   }
 
   /* ---------- input ---------- */
@@ -251,10 +520,10 @@
     a.addEventListener('focus', on); a.addEventListener('blur', off);
   });
 
-  // a new hue rides outward on the ripple's leading edge; rapid taps stack, each circle growing over the last
+  // the flipped palette rides outward on the ripple's leading edge; rapid taps stack, each circle growing over the last
   function recolor(px, py) {
-    paintHue(Math.round(hue + 60 + Math.random() * 240) % 360);   // always visibly different
-    pal = palette(hue);
+    paint(!inv);
+    pal = palette(inv);
     if (reduced) { base = pal; reveals.length = 0; return; }
     reveals.push({ x: px, y: py, t0: now, rad: 0, r: Math.hypot(Math.max(px, W - px), Math.max(py, H - py)), pal });
     if (reveals.length > MAX_REVEALS) base = reveals.shift().pal;
@@ -296,15 +565,13 @@
 
     // 0. separable terms: a handful of sines per row and per column instead of per cell
     for (let i = 0; i < cols; i++) {
-      const px = (i + 0.5) * cw, x = (px - W / 2) / unit;
-      colA[i] = x * 4.2 + now * 0.35;
-      colB[i] = 1.5 * Math.sin(x * 2.6 + now * 0.2);
+      const px = (i + 0.5) * cw;
+      colX[i] = (px - W / 2) / H;
       colS[i] = Math.sin(px * 0.011 + now * 0.9);
     }
     for (let j = 0; j < rows; j++) {
-      const py = (j + 0.5) * ch, y = (py - H / 2) / unit;
-      rowA[j] = 2 * Math.sin(y * 3.1 - now * 0.25);
-      rowB[j] = y * 5.0 - now * 0.30;
+      const py = (j + 0.5) * ch;
+      rowY[j] = (py - H / 2) / H;
       rowS[j] = 6 * Math.sin(py * 0.014 - now * 0.7);
     }
 
@@ -346,6 +613,19 @@
       }
     }
 
+    // backgrounds: switch on schedule, dissolving cell by cell; both run while they overlap. The
+    // schedule keeps wall-clock time, so slow frames (capped dt) and reduced motion don't stretch it
+    const wall = ms / 1000;
+    if (!nextName && wall > sceneUntil) { nextName = pick(sceneName); fadeT0 = wall; label(); }
+    let fade = 0;
+    if (nextName) {
+      fade = (wall - fadeT0) / FADE_SECS;
+      if (fade >= 1) { sceneName = nextName; nextName = null; fade = 0; sceneUntil = wall + SCENE_SECS; label(); }
+    }
+    const cur = SCENES[sceneName], nxt = nextName && SCENES[nextName];
+    cur.prep(dt);
+    if (nxt) nxt.prep(dt);
+
     // 2. paint the background: base, then each reveal circle on top
     ctx.globalAlpha = 1;
     ctx.fillStyle = base.bg;
@@ -381,25 +661,23 @@
 
         if (t !== null) {
           if (hitGrid[tIdx] >= 0 && hitGrid[tIdx] === hover) inverted.push(i, j, t);
-          else { chr = t; b = 2; }
+          else { chr = t; b = styleGrid[tIdx]; }
         } else {
           const su = i + 0.5 - gx * 40 / cw, sv = j + 0.5 - gy * 40 / ch;
           if (maskAt(su, sv)) {
-            chr = spec > 0.06 ? '@' : spec < -0.06 ? '%' : '#';
-            b = 2;
+            // the name is set in bits, each flipping on its own slow clock; faces turned from the light dim
+            chr = hash(i, j + Math.floor(now * 1.2 + hash(j, i) * 9)) < 0.5 ? '0' : '1';
+            b = spec < -0.06 ? 2 : HEAD;
           } else {
             let k = 1;
             while (k <= DEPTH && !maskAt(su - exX * k / DEPTH, sv - exY * k / DEPTH)) k++;
             if (k <= DEPTH) {
               chr = SIDE[k];
               b = k <= 2 ? 1 : 0;
-            } else {
-              // the sea: lit by the surface, but not refracted, so it stays two sines per cell
-              const a = Math.sin(colA[i] + rowA[j]), bb = Math.sin(rowB[j] + colB[i]);
-              let v = a * bb * 0.5 + 0.5;
-              v = v * v * v * v * 0.8 + Math.max(0, spec) * 2.2;
-              chr = RAMP[Math.max(0, Math.min(9, Math.floor(v * 10)))];
-              b = spec > 0.12 ? 2 : spec > 0.04 ? 1 : 0;
+            } else if (!calm[idx]) {
+              cb = 0;
+              chr = (nxt && thr[idx] < fade ? nxt : cur).cell(i, j, idx, px, py, spec, l, r, u, d, gx, gy);
+              b = cb;
             }
           }
         }
@@ -412,11 +690,14 @@
       }
 
       for (let p = 0; p <= reveals.length; p++) {
-        for (let b = 0; b < 3; b++) {
+        for (let b = 0; b < STYLES.length; b++) {
           if (!used[p][b]) continue;
-          ctx.globalAlpha = ALPHA[b];
-          ctx.fillStyle = layerPal(p).fg;
+          const st = STYLES[b];
+          ctx.globalAlpha = st.a;
+          ctx.fillStyle = layerPal(p)[st.c || 'fg'];
+          if (b > 2) ctx.font = fonts[b];
           ctx.fillText(bufs[p][b].join(''), 0, j * ch);
+          if (b > 2) ctx.font = fonts[0];
           bufs[p][b].fill(' ');
           used[p][b] = 0;
         }
@@ -428,10 +709,12 @@
     for (let k = 0; k < inverted.length; k += 3) {
       const i = inverted[k], j = inverted[k + 1];
       const p = layerPal(layerAt((i + 0.5) * cw, (j + 0.5) * ch));
-      ctx.fillStyle = p.fg;
+      ctx.fillStyle = p.ac;
       ctx.fillRect(i * cw - 0.5, j * ch, cw + 1, ch);
       ctx.fillStyle = p.bg;
+      ctx.font = fonts[LINK];
       ctx.fillText(inverted[k + 2], i * cw, j * ch);
+      ctx.font = fonts[0];
     }
   }
   requestAnimationFrame(frame);
