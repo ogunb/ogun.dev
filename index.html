@@ -13,7 +13,7 @@
   // ac is for links, a step past the text so they lift off everything else
   window.palette = inv => inv
     ? { bg: '#f1f1ee', fg: '#1b1b1b', ac: '#000' }
-    : { bg: '#0b0b0b', fg: '#e4e4e4', ac: '#fff' };
+    : { bg: '#000', fg: '#e4e4e4', ac: '#fff' };
   window.paint = inv => {
     const s = document.documentElement.style, p = palette(inv);
     for (const k in p) s.setProperty('--' + k, p[k]);
@@ -23,7 +23,7 @@
 </script>
 <style>
   :root {
-    --bg: #0c0c0c;
+    --bg: #000;
     --fg: #ececec;
   }
   html, body {
@@ -118,7 +118,7 @@
 
   let pal = palette(inv);
   let W, H, unit, cw, ch, cols, rows, fonts;
-  let textGrid, styleGrid, hitGrid, mask, calm, thr, mW, mH, Hall, Hwave, Q, clockAt, labelAt;
+  let textGrid, styleGrid, hitGrid, mask, calm, thr, mW, mH, Hall, Hwave, Q, clockAt, labelAt, relief;
   // per-column and per-row terms (swell, and positions in screen heights), refreshed every frame
   let colX, colS, rowY, rowS;
 
@@ -199,25 +199,52 @@
     const mx = Math.max(2, Math.round(pad / cw)), my = Math.max(1, Math.round(pad / ch));
 
     // the name, rasterised once into a mask at 2×2 samples per cell. When stacked (narrow or tall
-    // screens) the letters are condensed, so width stops being the limit and they can be twice as tall
+    // screens) the letters are condensed, so width stops being the limit and they can be much taller
     const lines = cols >= 72 && W / H > 1.25 ? [NAME] : NAME.split(' ');
-    const squeeze = lines.length > 1 ? 0.5 : 1;
+    const stacked = lines.length > 1;
     const mc = document.createElement('canvas');
     mW = cols * SS; mH = rows * SS;
     mc.width = mW; mc.height = mH;
     const m = mc.getContext('2d', { willReadFrequently: true });
     m.font = `800 100px ${MONO}`;
-    const widest = Math.max(...lines.map(l => m.measureText(l).width)) * squeeze;
-    const F = Math.min(100 * (W - 2 * mx * cw - 2 * cw) / widest, H * 0.4 / lines.length, 260);
-    m.setTransform(SS / cw * squeeze, 0, 0, SS / ch, 0, 0);
+    const adv100 = m.measureText('M').width;
+    let F, sx = 1, step = 0, nx = mx;
+    if (stacked) {
+      // a phone has only five or six cells per letter, so each letter gets its own whole number of
+      // cells with a blank column after it: at that size neighbours would otherwise fuse into one bar.
+      // Six cells is the least that reads, so on narrow phones the name gives up some of its margin
+      F = Math.min(H * 0.5 / lines.length / 0.95, 260);
+      const adv = adv100 * F / 100, longest = Math.max(...lines.map(l => l.length));
+      step = Math.min(Math.floor((W / cw - 0.5) / longest), Math.ceil(adv / cw) + 1);
+      nx = Math.min(mx, Math.round((W / cw - longest * step + 1) / 2));
+      sx = (step - 1) * cw / adv;
+    } else {
+      F = Math.min(100 * (W - 2 * mx * cw - 2 * cw) / m.measureText(NAME).width, H * 0.4, 260);
+    }
+    m.setTransform(SS / cw * sx, 0, 0, SS / ch, 0, 0);
     m.font = `800 ${F}px ${MONO}`;
     m.fillStyle = '#fff';
     const lh = F * 0.95;
     const top = H * 0.42 - lines.length * lh / 2;
-    lines.forEach((l, k) => m.fillText(l, mx * cw / squeeze, top + k * lh + F * 0.78));
+    lines.forEach((l, k) => {
+      const y = top + k * lh + F * 0.78;
+      if (stacked) [...l].forEach((c, q) => m.fillText(c, (nx + q * step) * cw / sx, y));
+      else m.fillText(l, mx * cw, y);
+    });
+    // the extrusion is sized for letters a dozen cells wide; smaller ones (phones) get a shallower one,
+    // or it floods their counters and the name stops reading
+    relief = Math.min(1, adv100 * F / 100 * sx / cw / 12);
+    // a cell belongs to the name when at least half of it is covered, not when one sample happens to
+    // land inside: thin strokes stay whole and counters stay open
     const px = m.getImageData(0, 0, mW, mH).data;
+    const on = (x, y) => px[(y * mW + x) * 4 + 3] > 110 ? 1 : 0;
     mask = new Uint8Array(mW * mH);
-    for (let i = 0; i < mask.length; i++) mask[i] = px[i * 4 + 3] > 110 ? 1 : 0;
+    for (let y = 0; y < mH; y += SS) {
+      for (let x = 0; x < mW; x += SS) {
+        if (on(x, y) + on(x + 1, y) + on(x, y + 1) + on(x + 1, y + 1) < 2) continue;
+        mask[y * mW + x] = mask[y * mW + x + 1] = mask[(y + 1) * mW + x] = mask[(y + 1) * mW + x + 1] = 1;
+      }
+    }
 
     // calm water round the name, two cells either side and one above and below, so it reads cleanly
     calm = new Uint8Array(n);
@@ -635,7 +662,7 @@
       ctx.beginPath(); ctx.arc(rv.x, rv.y, rv.rad, 0, Math.PI * 2); ctx.fill();
     }
 
-    const exX = -tiltX * 3.4, exY = -tiltY * 1.8;   // extrusion vector, in cells
+    const exX = -tiltX * 3.4 * relief, exY = -tiltY * 1.8 * relief;   // extrusion vector, in cells
     const inverted = [];
 
     // 3. every cell looks through the surface: refraction picks what it shows, the normal picks how bright
